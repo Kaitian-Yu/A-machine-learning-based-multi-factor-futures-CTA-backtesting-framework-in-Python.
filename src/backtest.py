@@ -399,3 +399,169 @@ def backtest_futures_static_threshold(
     missed_buys_df = pd.DataFrame(missed_buys)
 
     return equity_df, trades_df, pos_log, missed_buys_df
+
+
+
+def plot_equity_curve(equity_df: pd.DataFrame, title: str = "Portfolio Equity"):
+
+    df = equity_df.copy()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        
+        if 'datetime' in df.columns:
+            df = df.set_index(pd.to_datetime(df['datetime']))
+        else:
+            df.index = pd.to_datetime(df.index, errors='coerce')
+    df = df.sort_index()
+
+   
+    cummax = df['equity'].cummax()
+    dd = df['equity'] / cummax - 1.0
+    max_dd = dd.min()
+
+    fig, ax1 = plt.subplots(figsize=(10, 4.5))
+    ax1.plot(df.index, df['equity'], lw=1.6)
+    ax1.set_title(f"{title} | Max DD: {max_dd:.2%}")
+    ax1.set_ylabel("Equity")
+    ax1.grid(True, alpha=0.25)
+
+   
+    ax2 = ax1.twinx()
+    ax2.fill_between(df.index, dd, 0, step='pre', alpha=0.25)
+    ax2.set_yticks([])
+    plt.tight_layout()
+    plt.show()
+
+
+def trade_stats(trades_df: pd.DataFrame, equity_df: pd.DataFrame | None = None, risk_free: float = 0.0):
+    """
+    statistics:
+      -Win rate, profit/loss ratio, profit factor, expected return, etc.
+      - If equity_df is passed in, then annualized return, Sharpe ratio, and maximum drawdown will be calculated.
+      - If equity_df contains exposure / exposure_limit, then calculate the capital utilization rate.
+    """
+    td = trades_df.copy()
+    if 'fee' not in td.columns:
+        td['fee'] = 0.0
+    if 'side' not in td.columns:
+        raise ValueError("The trades_df file needs to include a column 'side' to distinguish between BUY and SELL.")
+    if 'pnl' not in td.columns:
+        raise ValueError("The trades_df file needs to include a column 'pnl' (which records the profit or loss in the SELL row).")
+
+    # Only closed (SELL) positions are counted as a complete transaction.
+    closed = td[td['side'].str.upper() == 'SELL'].copy()
+    if closed.empty:
+        raise ValueError("No SELL (closed position) records were detected, so no statistics can be compiled.")
+
+
+    wins  = closed[closed['pnl'] > 0]
+    loses = closed[closed['pnl'] <= 0]
+    n_trades = len(closed)
+    n_win  = len(wins)
+    n_lose = len(loses)
+
+    win_rate = (n_win / n_trades) if n_trades else np.nan
+    avg_win  = wins['pnl'].mean()  if n_win  else 0.0
+    avg_lose = loses['pnl'].mean() if n_lose else 0.0  
+    rr = (avg_win / abs(avg_lose)) if (n_win and n_lose and avg_lose != 0) else np.nan
+
+    gross_profit = wins['pnl'].sum()
+    gross_loss   = loses['pnl'].sum()  
+    profit_factor = (gross_profit / abs(gross_loss)) if gross_loss != 0 else np.inf
+
+    expectancy = closed['pnl'].mean()
+    fees_total = td['fee'].sum()
+
+    # Maximum number of consecutive losses
+    consec_losses = 0
+    max_consec_losses = 0
+    for x in (closed['pnl'] <= 0).astype(int).tolist():
+        if x == 1:
+            consec_losses += 1
+            max_consec_losses = max(max_consec_losses, consec_losses)
+        else:
+            consec_losses = 0
+
+    metrics = {
+        "trades": n_trades,
+        "win_rate": win_rate,
+        "avg_win": avg_win,
+        "avg_loss": avg_lose,
+        "reward_risk": rr,
+        "profit_factor": profit_factor,
+        "expectancy_per_trade": expectancy,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "fees_total": fees_total,
+        "max_consecutive_losses": max_consec_losses,
+    }
+
+    # ===== If there is an equity_df, then calculate the return/drawdown/capital utilization rate. =====
+    if equity_df is not None and not equity_df.empty:
+        edf = equity_df.copy()
+        if isinstance(edf.index, pd.DatetimeIndex):
+            edf = edf.sort_index()
+        else:
+            edf = edf.sort_values('datetime').set_index('datetime')
+
+        #Capital Curve Yield
+        ret = edf['equity'].pct_change().dropna()
+        if not ret.empty:
+            if isinstance(edf.index, pd.DatetimeIndex):
+                days = (edf.index[-1] - edf.index[0]).days
+                per_year = 252 if days == 0 else max(1, int(len(ret) * 365.25 / days))
+            else:
+                per_year = 252
+
+            mean_r = ret.mean()
+            std_r  = ret.std()
+            ann_return = (1 + mean_r) ** per_year - 1 if mean_r > -1 else np.nan
+            ann_vol    = std_r * np.sqrt(per_year) if std_r > 0 else np.nan
+            sharpe     = ((mean_r - risk_free/per_year) / std_r) * np.sqrt(per_year) if std_r > 0 else np.nan
+
+            curve = edf['equity']
+            cummax = curve.cummax()
+            dd = curve / cummax - 1.0
+            max_dd = float(dd.min())
+
+            metrics.update({
+                "ann_return": ann_return,
+                "ann_vol": ann_vol,
+                "sharpe": sharpe,
+                "max_drawdown": max_dd,
+            })
+
+        # ===== Capital utilization rate (leverage utilization rate)=====
+        if {'exposure', 'exposure_limit'}.issubset(edf.columns):
+            usage = edf.copy()
+            mask = usage['exposure_limit'] > 0
+            usage = (usage.loc[mask, 'exposure'] / usage.loc[mask, 'exposure_limit']).clip(lower=0)
+            if not usage.empty:
+                metrics.update({
+                    "avg_usage": usage.mean(),
+                    "max_usage": usage.max(),
+                    "p90_usage": usage.quantile(0.9),
+                })
+
+    # ===== Print results =====
+    print("\n==== Trade Stats ====")
+    print(f"Trades: {metrics['trades']}")
+    print(f"Win rate: {metrics['win_rate']:.2%}")
+    print(f"Avg win: {metrics['avg_win']:.2f} | Avg loss: {metrics['avg_loss']:.2f}")
+    print(f"Reward/Risk: {metrics['reward_risk'] if np.isfinite(metrics['reward_risk']) else np.nan:.3f}")
+    print(f"Profit Factor: {metrics['profit_factor'] if np.isfinite(metrics['profit_factor']) else np.inf:.3f}")
+    print(f"Expectancy / trade: {metrics['expectancy_per_trade']:.2f}")
+    print(f"Fees total: {metrics['fees_total']:.2f}")
+    print(f"Max consecutive losses: {metrics['max_consecutive_losses']}")
+
+    if equity_df is not None and 'ann_return' in metrics:
+        print(f"Ann. Return: {metrics['ann_return']:.2%} | "
+              f"Ann. Vol: {metrics['ann_vol']:.2%} | Sharpe: {metrics['sharpe']:.2f}")
+        print(f"Max Drawdown: {metrics['max_drawdown']:.2%}")
+
+    if equity_df is not None and 'avg_usage' in metrics:
+        print(f"Capital usage (exposure / limit): "
+              f"Avg {metrics['avg_usage']:.2%}, "
+              f"Max {metrics['max_usage']:.2%}, "
+              f"P90 {metrics['p90_usage']:.2%}")
+
+    return metrics
