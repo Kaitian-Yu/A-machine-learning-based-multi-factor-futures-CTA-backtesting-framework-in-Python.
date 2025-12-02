@@ -34,6 +34,9 @@ def add_tech_factors(df, short_win=12, long_win=48, vol_win=20):
     df['MTM_long'] = df['close'] - df['close'].shift(15)
     df["vol_scale"] = apply_vol_target(df, target_vol=0.11, window=60)
 
+    g = df.groupby('symbol', group_keys=False)
+    df['future_ret_1'] = g['close'].shift(-1) / df['close'] - 1
+    df = df.dropna(subset=['future_ret_1','vol_scale'])
     return df
 
 
